@@ -47,4 +47,4 @@ git clone <your-repo>
 cd academic-rag-assistant
 python -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt# academic-rag-assistant
