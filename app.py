@@ -1,237 +1,445 @@
 """
-app.py
-------
-Streamlit UI for Local RAG System
+app.py — Main Streamlit Application for the AI-Powered Academic Assistant
+
+This is the entry point of the project. It:
+  1. Provides a chat interface for students to ask questions.
+  2. Handles PDF uploads and triggers document ingestion.
+  3. Retrieves relevant chunks from ChromaDB using LangChain.
+  4. Sends retrieved chunks + question to GPT-4o-mini and shows the answer.
+  5. Displays source references (document name + page number).
 """
 
 import os
 import streamlit as st
 from dotenv import load_dotenv
-from reportlab.pdfgen import canvas
-from ingest import ingest_pdf, get_vector_store
-from langchain_ollama import OllamaLLM
 
+# LangChain components
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+
+# Local module for ingesting PDFs
+from ingest import ingest_pdfs
+
+# ── Load environment variables from .env file ──────────────────────────────────
 load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-UPLOAD_DIR = "data/uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-
-# -----------------------------
-# RETRIEVAL
-# -----------------------------
-def retrieve_chunks(question):
-    vector_store = get_vector_store()
-    return vector_store.similarity_search(question, k=2)
+# ── Constants ──────────────────────────────────────────────────────────────────
+CHROMA_DIR   = "./chroma_db"      # Where ChromaDB stores its data
+DATA_DIR     = "./data"           # Where uploaded PDFs are saved
+MODEL_NAME   = os.getenv("LLM_MODEL", "gpt-4o-mini")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+TOP_K        = 4                  # Number of document chunks to retrieve per query
 
 
-# -----------------------------
-# PROMPT BUILDER
-# -----------------------------
-def build_prompt(question, chunks):
-    context = "\n\n".join([c.page_content[:1000] for c in chunks])
-
-    return f"""
-You are an academic assistant.
-Answer ONLY from context.
-
-CONTEXT:
-{context}
-
-QUESTION:
-{question}
-
-ANSWER:
-"""
+# ── Page configuration ─────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Academic RAG Assistant",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
-# -----------------------------
-# LLM RESPONSE
-# -----------------------------
-def generate_answer(prompt):
-    llm = OllamaLLM(model="phi3")
-    return llm.invoke(prompt)
-
-
-# -----------------------------
-# UI
-# -----------------------------
-# CHANGE: added page_icon so the browser tab looks more polished
-st.set_page_config(page_title="RAG Assistant", page_icon="📚", layout="wide")
-
-# CHANGE: added a sidebar with project info (does not affect app logic at all,
-# it's just a separate panel Streamlit renders next to the main page)
-with st.sidebar:
-    st.header("ℹ️ About this Project")
-    st.markdown(
-        """
-        **AI-Powered Academic Assistant**
-
-        A local Retrieval-Augmented Generation (RAG)
-        system that answers questions using **only**
-        the content of your uploaded PDFs.
-        """
-    )
-
-    # CHANGE: small divider for visual separation in the sidebar
-    st.divider()
-
-    st.subheader("⚙️ Tech Stack")
-    st.markdown(
-        """
-        - 🐍 Python + Streamlit
-        - 🔗 LangChain
-        - 🗄️ ChromaDB (vector storage)
-        - 🧠 Sentence-Transformers (embeddings)
-        - 🤖 Ollama — `phi3` (local LLM)
-        """
-    )
-
-    st.divider()
-
-    st.subheader("📝 How to Use")
-    st.markdown(
-        """
-        1. Upload one or more PDFs
-        2. Click **Process Documents**
-        3. Type your question
-        4. Click **Ask**
-        """
-    )
-
-st.title("📚 Local AI Academic Assistant (RAG)")
-# CHANGE: added a short caption under the title for extra context/spacing
-st.caption("Upload your study material and ask questions — answers come only from your documents.")
-
-# CHANGE: extra blank line equivalent for breathing room before the first section
-st.write("")
-
-# Upload
-# CHANGE: added an icon and changed header level (st.subheader) so it's visually
-# smaller than the main title, giving a cleaner heading hierarchy
-st.subheader("📤 Step 1: Upload PDFs")
-
-files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
-
-# CHANGE: wrapped button in a column so it doesn't stretch the full page width
-# (purely cosmetic spacing change, does not change what the button does)
-col1, _ = st.columns([1, 4])
-with col1:
-    process_clicked = st.button("⚙️ Process Documents", use_container_width=True)
-
-if process_clicked:
-    if files:
-        # CHANGE: spinner gives feedback while files are being processed,
-        # instead of the page looking "stuck" with no response
-        with st.spinner("Processing documents, please wait..."):
-            for f in files:
-                path = os.path.join(UPLOAD_DIR, f.name)
-                with open(path, "wb") as out:
-                    out.write(f.getbuffer())
-
-                chunks = ingest_pdf(path, f.name)
-                # CHANGE: added an icon to the success message for clearer visual feedback
-                st.success(f"✅ **{f.name}** processed — {chunks} chunks stored")
-    else:
-        # CHANGE: added an explicit error message when no files are selected
-        # (previously clicking the button with no files did nothing visible)
-        st.error("⚠️ Please upload at least one PDF before processing.")
-
-
-st.divider()
-
-# Chat
-# CHANGE: added icon + step numbering to match the "Step 1 / Step 2" flow .
-st.subheader("💬 Step 2: Ask Questions")
-
-question = st.text_input("Enter your question", placeholder="e.g. What is the main topic of chapter 2?")
-
-# CHANGE:same column trick as above, just for consistent button sizing/spacing
-col2, _ = st.columns([1, 4])
-with col2:
-    ask_clicked = st.button("🔍 Ask", use_container_width=True)
-
-# CHANGE: track the last answer in session_state so the Download button
-# (further down) can still access it after Streamlit reruns the script.
-# This does not change the RAG logic — it only fixes the UI so the
-# Download button reliably has an answer to export.
-if "last_answer" not in st.session_state:
-    st.session_state.last_answer = None
-
-if ask_clicked:
-    if question:
-        # CHANGE: spinner while retrieving + generating, so the user knows
-        # the app is working instead of appearing frozeN
-        with st.spinner("Searching documents and generating answer..."):
-            chunks = retrieve_chunks(question)
-
-            if not chunks:
-                # CHANGE: added icon to warning message
-                st.warning("⚠️ No data found. Please upload and process PDFs first.")
-            else:
-                prompt = build_prompt(question, chunks)
-                answer = generate_answer(prompt)
-
-                # CHANGE: save answer to session_state so it survives for the
-                # Download Answer button below
-                st.session_state.last_answer = answer
-
-                st.write("")  # CHANGE: small spacing before the answer block
-                st.subheader("✅ Answer")
-                st.write(answer)
-
-                st.write("")  # CHANGE: small spacing before the sources block
-                st.subheader("📑 Sources")
-                for i, c in enumerate(chunks):
-                    source = c.metadata.get("source", "unknown")
-                    page = c.metadata.get("page", "N/A")
-
-                    with st.expander(f"📄 Chunk {i+1} | {source} | Page {page}"):
-                        st.write(c.page_content)
-    else:
-        # CHANGE: added explicit error message when the question box is empty
-        st.error("⚠️ Please type a question before clicking Ask.")
-
-
-def export_pdf(text):
-    file = "answer.pdf"
-    c = canvas.Canvas(file)
-    c.drawString(100, 800, text[:1000])
-    c.save()
-    return file
-
-
-st.write("")  # CHANGE: spacing before the download section
-st.divider()
-
-# CHANGE: added a small heading so this section doesn't look orphaned
-st.subheader("📥 Step 3 (Optional): Download Your Answer")
-
-# CHANGE: column wrapper for consistent button sizing/spacing
-col3, _ = st.columns([1, 4])
-with col3:
-    download_clicked = st.button("📥 Download Answer", use_container_width=True)
-
-if download_clicked:
-    # CHANGE: use the saved session_state answer instead of the old "answer"
-    # variable, which only existed inside the "if ask_clicked" block above
-    # and would crash this button with a NameError if clicked separately.
-    if st.session_state.last_answer:
-        file = export_pdf(st.session_state.last_answer)
-        # CHANGE: added icon + clearer wording to the success message
-        st.success("✅ PDF generated successfully! Check your project folder for 'answer.pdf'.")
-    else:
-        # CHANGE: added a friendly error instead of letting the app crash
-        # when there is no answer yet to export
-        st.error("⚠️ No answer available yet. Please ask a question first.")
-
-# -----------------------------
-# FOOTER
-# -----------------------------
-# CHANGE: added a footer with developer names, separated visually with a divider
-st.divider()
+# ── Custom CSS for a clean, academic look ─────────────────────────────────────
 st.markdown("""
-    <div style='text-align: center; color: gray; font-size: 0.85em;'>
-        Developed by <b>Harsh and Karim</b> &nbsp;|&nbsp; AI-Powered Academic Assistant (RAG) Project
-    </div>""",
-    unsafe_allow_html=True,)
+<style>
+    /* Main container */
+    .main { background-color: #f8f9fa; }
+
+    /* Chat message bubbles */
+    .user-bubble {
+        background: #4A90D9;
+        color: white;
+        padding: 12px 16px;
+        border-radius: 18px 18px 4px 18px;
+        margin: 8px 0;
+        max-width: 80%;
+        margin-left: auto;
+        word-wrap: break-word;
+    }
+    .assistant-bubble {
+        background: #ffffff;
+        color: #1a1a2e;
+        padding: 12px 16px;
+        border-radius: 18px 18px 18px 4px;
+        margin: 8px 0;
+        max-width: 85%;
+        border: 1px solid #e0e0e0;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        word-wrap: break-word;
+    }
+
+    /* Source citation boxes */
+    .source-box {
+        background: #eef4ff;
+        border-left: 3px solid #4A90D9;
+        padding: 8px 12px;
+        border-radius: 0 8px 8px 0;
+        margin-top: 8px;
+        font-size: 0.82em;
+        color: #555;
+    }
+
+    /*
+     * NEW: chunk-text shows the actual retrieved passage.
+     * It sits beneath its source-box header, styled like a
+     * blockquote so it's clearly "quoted from the document".
+     */
+    .chunk-text {
+        background: #f5f8ff;
+        border-left: 3px solid #c5d8f5;
+        padding: 8px 12px;
+        margin: 4px 0 12px 0;
+        border-radius: 0 6px 6px 0;
+        font-size: 0.80em;
+        color: #444;
+        font-style: italic;
+        line-height: 1.5;
+        white-space: pre-wrap;   /* preserves line breaks from the PDF */
+    }
+
+    /* Sidebar styling */
+    .sidebar-header {
+        font-size: 1.1em;
+        font-weight: 700;
+        color: #1a1a2e;
+        margin-bottom: 4px;
+    }
+
+    /* Status badges */
+    .badge-success {
+        background: #d4edda;
+        color: #155724;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.78em;
+        font-weight: 600;
+    }
+    .badge-info {
+        background: #d1ecf1;
+        color: #0c5460;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.78em;
+        font-weight: 600;
+    }
+
+    /* Hide Streamlit branding */
+    #MainMenu { visibility: hidden; }
+    footer    { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ── Session state initialisation ───────────────────────────────────────────────
+# Streamlit reruns the script on every interaction, so we use st.session_state
+# to persist data (chat history, the QA chain, etc.) across reruns.
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []        # List of (question, answer, sources) tuples
+
+if "qa_chain" not in st.session_state:
+    st.session_state.qa_chain = None          # Will hold the LangChain QA chain
+
+if "docs_ingested" not in st.session_state:
+    st.session_state.docs_ingested = False    # Flag: have PDFs been processed?
+
+if "ingested_files" not in st.session_state:
+    st.session_state.ingested_files = []      # List of ingested PDF filenames
+
+
+# ── Helper: load or reload the RAG chain ──────────────────────────────────────
+def load_qa_chain():
+    """
+    Builds the ConversationalRetrievalChain:
+      - Connects to the ChromaDB vector store.
+      - Uses OpenAI embeddings to encode queries.
+      - Uses GPT-4o-mini as the answer-generating LLM.
+      - Maintains conversation memory across turns.
+    """
+    # Step 1: Create embedding model (same one used during ingestion)
+    embeddings = OpenAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        openai_api_key=OPENAI_API_KEY,
+    )
+
+    # Step 2: Connect to the existing ChromaDB collection
+    vectorstore = Chroma(
+        persist_directory=CHROMA_DIR,
+        embedding_function=embeddings,
+        collection_name="academic_docs",
+    )
+
+    # Step 3: Create a retriever — this is what fetches the top-K relevant chunks
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",   # Cosine similarity search
+        search_kwargs={"k": TOP_K}, # Return the 4 most relevant chunks
+    )
+
+    # Step 4: Initialise the LLM (GPT-4o-mini is fast and cost-effective)
+    llm = ChatOpenAI(
+        model_name=MODEL_NAME,
+        temperature=0.2,            # Low temperature = more factual, less creative
+        openai_api_key=OPENAI_API_KEY,
+    )
+
+    # Step 5: Conversation memory — stores previous Q&A pairs so the chatbot
+    #         understands follow-up questions like "Can you explain that further?"
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        return_messages=True,
+        output_key="answer",        # Tell memory which output key to store
+    )
+
+    # Step 6: Build the full RAG chain
+    qa_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True,  # We want to display the source chunks
+        verbose=False,
+    )
+
+    return qa_chain
+
+
+# ── Helper: render source citations for a list of retrieved chunks ─────────────
+def render_sources(source_documents: list, expanded: bool = False):
+    """
+    Displays each retrieved chunk as:
+        📄  lecture_notes.pdf — Page 3
+        "...the actual text that was retrieved from that page..."
+
+    Why a helper function?
+        We call this in two places — when replaying chat history AND when
+        displaying a brand-new answer. A helper means we write the logic
+        once and reuse it, so both places always look identical.
+
+    Args:
+        source_documents : list of LangChain Document objects returned by
+                           the RAG chain under the key "source_documents".
+        expanded         : whether the expander starts open or collapsed.
+                           True for new answers (user wants to see sources
+                           immediately), False for replayed history (keeps
+                           the screen tidy).
+    """
+    if not source_documents:
+        return  # Nothing to show — exit early
+
+    with st.expander("📎 Sources used", expanded=expanded):
+
+        # We loop through every retrieved chunk (up to TOP_K = 4).
+        # Each chunk is a LangChain Document with two attributes:
+        #   doc.page_content  — the raw text of this chunk
+        #   doc.metadata      — a dict containing "source" and "page"
+        for i, doc in enumerate(source_documents):
+
+            # ── Extract metadata ──────────────────────────────────────────
+            source_path = doc.metadata.get("source", "Unknown document")
+            raw_page    = doc.metadata.get("page", 0)
+
+            # FIX: PyPDF numbers pages from 0 internally, but humans
+            # expect page 1 to mean the first page.  Adding 1 here means
+            # "Page 1" in the UI always matches what the student sees
+            # when they open the PDF in their viewer.
+            human_page = raw_page + 1
+
+            # Show just the filename, not the full path on disk.
+            # e.g.  "./data/lecture_notes.pdf"  →  "lecture_notes.pdf"
+            file_label = os.path.basename(source_path)
+
+            # ── Chunk text ────────────────────────────────────────────────
+            # doc.page_content is the exact text that was fed to the LLM.
+            # We truncate to 400 characters so it's readable but not
+            # overwhelming — a "…" at the end signals there's more.
+            chunk_text = doc.page_content.strip()
+            if len(chunk_text) > 400:
+                chunk_text = chunk_text[:400] + "…"
+
+            # ── Render: header badge then quoted text ─────────────────────
+            st.markdown(
+                f'<div class="source-box">'
+                f'📄 <strong>{file_label}</strong> &nbsp;—&nbsp; Page {human_page}'
+                f'&nbsp; <span style="color:#999;font-size:0.85em;">'
+                f'(chunk {i + 1} of {len(source_documents)})</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div class="chunk-text">{chunk_text}</div>',
+                unsafe_allow_html=True,
+            )
+
+
+def check_existing_db():
+    """Returns True if the ChromaDB directory has content from a previous session."""
+    return (
+        os.path.exists(CHROMA_DIR)
+        and len(os.listdir(CHROMA_DIR)) > 0
+    )
+
+
+# ── Auto-load chain if DB already exists (e.g., from a previous session) ──────
+if check_existing_db() and st.session_state.qa_chain is None:
+    with st.spinner("🔄 Loading existing knowledge base..."):
+        st.session_state.qa_chain = load_qa_chain()
+        st.session_state.docs_ingested = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 📚 Academic RAG Assistant")
+    st.markdown("*Upload your study materials and ask questions.*")
+    st.divider()
+
+    # ── PDF Upload Section ────────────────────────────────────────────────────
+    st.markdown('<div class="sidebar-header">📂 Upload Documents</div>', unsafe_allow_html=True)
+
+    uploaded_files = st.file_uploader(
+        label="Choose PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Upload lecture notes, assignments, or any academic PDFs.",
+    )
+
+    # Process button — only shown after files are selected
+    if uploaded_files:
+        if st.button("⚡ Process & Index PDFs", type="primary", use_container_width=True):
+            os.makedirs(DATA_DIR, exist_ok=True)
+
+            # Save uploaded files to the data/ directory
+            saved_paths = []
+            for uploaded_file in uploaded_files:
+                save_path = os.path.join(DATA_DIR, uploaded_file.name)
+                with open(save_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                saved_paths.append(save_path)
+
+            # Run the ingestion pipeline (defined in ingest.py)
+            with st.spinner("🔍 Extracting text, chunking, and embedding PDFs..."):
+                num_chunks = ingest_pdfs(DATA_DIR, CHROMA_DIR, OPENAI_API_KEY, EMBEDDING_MODEL)
+
+            # Load the QA chain after ingestion
+            st.session_state.qa_chain = load_qa_chain()
+            st.session_state.docs_ingested = True
+            st.session_state.ingested_files = [f.name for f in uploaded_files]
+
+            st.success(f"✅ Indexed {num_chunks} chunks from {len(uploaded_files)} PDF(s)!")
+
+    st.divider()
+
+    # ── Knowledge Base Status ────────────────────────────────────────────────
+    st.markdown('<div class="sidebar-header">🗄️ Knowledge Base</div>', unsafe_allow_html=True)
+
+    if st.session_state.docs_ingested:
+        st.markdown('<span class="badge-success">● Active</span>', unsafe_allow_html=True)
+        if st.session_state.ingested_files:
+            st.markdown("**Loaded files:**")
+            for fname in st.session_state.ingested_files:
+                st.markdown(f"- 📄 {fname}")
+    else:
+        st.markdown('<span class="badge-info">○ No documents loaded</span>', unsafe_allow_html=True)
+        st.info("Upload PDFs above to get started.")
+
+    st.divider()
+
+    # ── Clear Chat ────────────────────────────────────────────────────────────
+    if st.button("🗑️ Clear Chat History", use_container_width=True):
+        st.session_state.chat_history = []
+        # Rebuild chain to reset memory
+        if st.session_state.qa_chain:
+            st.session_state.qa_chain = load_qa_chain()
+        st.rerun()
+
+    st.divider()
+
+    # ── Settings Info ─────────────────────────────────────────────────────────
+    with st.expander("⚙️ Settings"):
+        st.markdown(f"**LLM:** `{MODEL_NAME}`")
+        st.markdown(f"**Embeddings:** `{EMBEDDING_MODEL}`")
+        st.markdown(f"**Chunks retrieved:** `{TOP_K}`")
+        st.markdown(f"**Vector DB:** ChromaDB")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN CHAT AREA
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("# 🎓 Academic Assistant")
+st.markdown("Ask questions about your uploaded study materials. I answer *only* using the content in your documents.")
+st.divider()
+
+# ── Render existing chat history ──────────────────────────────────────────────
+for question, answer, sources in st.session_state.chat_history:
+    # User message
+    with st.chat_message("user", avatar="🧑‍🎓"):
+        st.markdown(question)
+
+    # Assistant message
+    with st.chat_message("assistant", avatar="📚"):
+        st.markdown(answer)
+
+        # Show source references for this historical message.
+        # expanded=False keeps old messages tidy — the student can
+        # click open any one they want to re-read.
+        render_sources(sources, expanded=False)
+
+
+# ── Chat input box ─────────────────────────────────────────────────────────────
+user_question = st.chat_input(
+    placeholder="Ask a question about your documents...",
+    disabled=not st.session_state.docs_ingested,
+)
+
+# ── If the user has typed a question ─────────────────────────────────────────
+if user_question:
+    if not st.session_state.qa_chain:
+        st.error("⚠️ Please upload and process PDF documents first.")
+        st.stop()
+
+    # Show the user's message immediately
+    with st.chat_message("user", avatar="🧑‍🎓"):
+        st.markdown(user_question)
+
+    # Generate the answer using the RAG chain
+    with st.chat_message("assistant", avatar="📚"):
+        with st.spinner("🔍 Searching documents and generating answer..."):
+            # The chain: retrieves chunks → formats prompt → calls GPT → returns answer
+            result = st.session_state.qa_chain.invoke({"question": user_question})
+
+            answer          = result.get("answer", "I could not find an answer in the uploaded documents.")
+            source_documents = result.get("source_documents", [])
+
+        st.markdown(answer)
+
+        # Show source references for the new answer.
+        # expanded=True pops it open immediately so the student sees
+        # exactly which chunks the AI used to form this response.
+        render_sources(source_documents, expanded=True)
+
+    # Persist this exchange to session history
+    st.session_state.chat_history.append((user_question, answer, source_documents))
+
+
+# ── Empty state prompt ────────────────────────────────────────────────────────
+if not st.session_state.chat_history and st.session_state.docs_ingested:
+    st.markdown("""
+    <div style='text-align:center; color:#888; padding:40px 0;'>
+        <h3 style='color:#aaa;'>💬 Ask your first question!</h3>
+        <p>Try: <em>"Summarise the key topics in this document."</em></p>
+        <p>Or: <em>"What does the document say about neural networks?"</em></p>
+    </div>
+    """, unsafe_allow_html=True)
+
+if not st.session_state.docs_ingested:
+    st.markdown("""
+    <div style='text-align:center; color:#888; padding:60px 0;'>
+        <h2 style='color:#aaa;'>📂 Start by uploading your PDFs</h2>
+        <p>Use the sidebar on the left to upload lecture notes, assignments, or any academic PDF.</p>
+        <p>Once processed, you can ask questions and get answers grounded in your documents.</p>
+    </div>
+    """, unsafe_allow_html=True)
