@@ -1,406 +1,180 @@
 """
-app.py — Main Streamlit Application for the AI-Powered Academic Assistant
-
-This is the entry point of the project. It:
-  1. Provides a chat interface for students to ask questions.
-  2. Handles PDF uploads and triggers document ingestion.
-  3. Retrieves relevant chunks from ChromaDB using LangChain.
-  4. Sends retrieved chunks + question to GPT-4o-mini and shows the answer.
-  5. Displays source references (document name + page number).
+app.py — Fully Local Streamlit Application for the AI-Powered Academic Assistant
 """
 
 import os
 import streamlit as st
-from dotenv import load_dotenv
 
 # LangChain components
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_ollama import ChatOllama
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.messages import HumanMessage, AIMessage
 
 # Local module for ingesting PDFs
 from ingest import ingest_pdfs
 
-# ── Load environment variables from .env file ──────────────────────────────────
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+CHROMA_DIR   = "./chroma_db"
+DATA_DIR     = "./data"
+MODEL_NAME   = "phi3:mini"
+TOP_K        = 4
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-CHROMA_DIR   = "./chroma_db"      # Where ChromaDB stores its data
-DATA_DIR     = "./data"           # Where uploaded PDFs are saved
-MODEL_NAME   = os.getenv("LLM_MODEL", "gpt-4o-mini")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-TOP_K        = 4                  # Number of document chunks to retrieve per query
-
-
-# ── Page configuration ─────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Academic RAG Assistant",
+    page_title="Academic RAG Assistant (Local)",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-# ── Custom CSS for a clean, academic look ─────────────────────────────────────
-st.markdown("""
-<style>
-    /* Main container */
-    .main { background-color: #f8f9fa; }
-
-    /* Chat message bubbles */
-    .user-bubble {
-        background: #4A90D9;
-        color: white;
-        padding: 12px 16px;
-        border-radius: 18px 18px 4px 18px;
-        margin: 8px 0;
-        max-width: 80%;
-        margin-left: auto;
-        word-wrap: break-word;
-    }
-    .assistant-bubble {
-        background: #ffffff;
-        color: #1a1a2e;
-        padding: 12px 16px;
-        border-radius: 18px 18px 18px 4px;
-        margin: 8px 0;
-        max-width: 85%;
-        border: 1px solid #e0e0e0;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-        word-wrap: break-word;
-    }
-
-    /* Source citation boxes — now handled by native st.expander, no custom CSS needed */
-
-    /* Sidebar styling */
-    .sidebar-header {
-        font-size: 1.1em;
-        font-weight: 700;
-        color: #1a1a2e;
-        margin-bottom: 4px;
-    }
-
-    /* Status badges */
-    .badge-success {
-        background: #d4edda;
-        color: #155724;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.78em;
-        font-weight: 600;
-    }
-    .badge-info {
-        background: #d1ecf1;
-        color: #0c5460;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.78em;
-        font-weight: 600;
-    }
-
-    /* Hide Streamlit branding */
-    #MainMenu { visibility: hidden; }
-    footer    { visibility: hidden; }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ── Session state initialisation ───────────────────────────────────────────────
-# Streamlit reruns the script on every interaction, so we use st.session_state
-# to persist data (chat history, the QA chain, etc.) across reruns.
-
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []        # List of (question, answer, sources) tuples
-
+    st.session_state.chat_history = []
 if "qa_chain" not in st.session_state:
-    st.session_state.qa_chain = None          # Will hold the LangChain QA chain
-
+    st.session_state.qa_chain = None
 if "docs_ingested" not in st.session_state:
-    st.session_state.docs_ingested = False    # Flag: have PDFs been processed?
-
+    st.session_state.docs_ingested = False
 if "ingested_files" not in st.session_state:
-    st.session_state.ingested_files = []      # List of ingested PDF filenames
+    st.session_state.ingested_files = []
 
-
-# ── Helper: load or reload the RAG chain ──────────────────────────────────────
 def load_qa_chain():
-    """
-    Builds the ConversationalRetrievalChain:
-      - Connects to the ChromaDB vector store.
-      - Uses OpenAI embeddings to encode queries.
-      - Uses GPT-4o-mini as the answer-generating LLM.
-      - Maintains conversation memory across turns.
-    """
-    # Step 1: Create embedding model (same one used during ingestion)
-    embeddings = OpenAIEmbeddings(
-        model=EMBEDDING_MODEL,
-        openai_api_key=OPENAI_API_KEY,
-    )
-
-    # Step 2: Connect to the existing ChromaDB collection
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     vectorstore = Chroma(
         persist_directory=CHROMA_DIR,
         embedding_function=embeddings,
         collection_name="academic_docs",
     )
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": TOP_K})
+    llm = ChatOllama(model=MODEL_NAME, temperature=0.2)
 
-    # Step 3: Create a retriever — this is what fetches the top-K relevant chunks
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",   # Cosine similarity search
-        search_kwargs={"k": TOP_K}, # Return the 4 most relevant chunks
+    contextualize_q_system_prompt = (
+        "Given a chat history and the latest user question which might reference context in the chat history, "
+        "formulate a standalone question which can be understood without the chat history. Do NOT answer the question, "
+        "just reformulate it if needed and otherwise return it as is."
     )
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system", contextualize_q_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
 
-    # Step 4: Initialise the LLM (GPT-4o-mini is fast and cost-effective)
-    llm = ChatOpenAI(
-        model_name=MODEL_NAME,
-        temperature=0.2,            # Low temperature = more factual, less creative
-        openai_api_key=OPENAI_API_KEY,
+    qa_system_prompt = (
+        "You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer "
+        "the question. If you don't know the answer, say that you don't know. Answer strictly based on the text.\n\n{context}"
     )
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", qa_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
 
-    # Step 5: Conversation memory — stores previous Q&A pairs so the chatbot
-    #         understands follow-up questions like "Can you explain that further?"
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer",        # Tell memory which output key to store
-    )
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    return create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
-    # Step 6: Build the full RAG chain
-    qa_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        return_source_documents=True,  # We want to display the source chunks
-        verbose=False,
-    )
-
-    return qa_chain
-
-
-# ── Helper: render source citations for a list of retrieved chunks ─────────────
 def render_sources(source_documents: list, expanded: bool = False):
-    """
-    Gives each retrieved chunk its own collapsible expander, showing:
-      - PDF filename and page number in the expander header
-      - The retrieved text passage inside the expander body
-
-    Each chunk gets a separate expander so the student can open or close
-    individual sources independently, rather than everything being grouped
-    under one panel.
-
-    Args:
-        source_documents : list of LangChain Document objects returned by
-                           the RAG chain under the key "source_documents".
-        expanded         : whether each expander starts open or collapsed.
-                           True for fresh answers, False for chat history.
-    """
     if not source_documents:
-        return  # Nothing to show — exit early
+        return
+    with st.expander("📎 Sources used", expanded=expanded):
+        for i, doc in enumerate(source_documents):
+            source_path = doc.metadata.get("source", "Unknown document")
+            raw_page    = doc.metadata.get("page", 0)
+            file_label = os.path.basename(source_path)
+            chunk_text = doc.page_content.strip()
+            if len(chunk_text) > 400:
+                chunk_text = chunk_text[:400] + "…"
+            st.markdown(f'📄 <strong>{file_label}</strong> — Page {raw_page + 1}', unsafe_allow_html=True)
+            st.info(chunk_text)
 
-    st.caption(f"📎 {len(source_documents)} source chunk(s) retrieved")
+if os.path.exists(CHROMA_DIR) and len(os.listdir(CHROMA_DIR)) > 0 and st.session_state.qa_chain is None:
+    st.session_state.qa_chain = load_qa_chain()
+    st.session_state.docs_ingested = True
 
-    # Loop through every retrieved chunk (up to TOP_K = 4).
-    # Each chunk is a LangChain Document object with:
-    #   doc.page_content  — the raw text of this chunk
-    #   doc.metadata      — dict with keys "source" (file path) and "page" (int)
-    for i, doc in enumerate(source_documents):
-
-        # ── 1. Pull out filename and page number ──────────────────────────
-        source_path = doc.metadata.get("source", "Unknown document")
-        raw_page    = doc.metadata.get("page", 0)
-
-        # PyPDF numbers pages starting at 0 internally.
-        # Adding 1 makes "Page 1" match what the student sees in their PDF viewer.
-        human_page = raw_page + 1
-
-        # Strip the folder path — show only the filename.
-        # e.g. "./data/lecture_notes.pdf"  →  "lecture_notes.pdf"
-        file_label = os.path.basename(source_path)
-
-        # ── 2. Build the expander label (shown even when collapsed) ───────
-        # This is the one line the student sees before clicking.
-        # Format: "📄 lecture_notes.pdf — Page 3"
-        expander_label = f"📄 {file_label} — Page {human_page}"
-
-        # ── 3. Render: one expander per chunk ────────────────────────────
-        with st.expander(expander_label, expanded=expanded):
-
-            # Show the chunk number as small helper text inside the panel
-            st.caption(f"Chunk {i + 1} of {len(source_documents)}")
-
-            # doc.page_content is the exact passage the LLM used to form
-            # its answer. st.markdown renders it cleanly — no custom HTML needed.
-            st.markdown(doc.page_content.strip())
-
-
-def check_existing_db():
-    """Returns True if the ChromaDB directory has content from a previous session."""
-    return (
-        os.path.exists(CHROMA_DIR)
-        and len(os.listdir(CHROMA_DIR)) > 0
-    )
-
-
-# ── Auto-load chain if DB already exists (e.g., from a previous session) ──────
-if check_existing_db() and st.session_state.qa_chain is None:
-    with st.spinner("🔄 Loading existing knowledge base..."):
-        st.session_state.qa_chain = load_qa_chain()
-        st.session_state.docs_ingested = True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SIDEBAR
-# ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 📚 Academic RAG Assistant")
-    st.markdown("*Upload your study materials and ask questions.*")
-    st.divider()
-
-    # ── PDF Upload Section ────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-header">📂 Upload Documents</div>', unsafe_allow_html=True)
+    st.markdown("## 📚 Local Academic RAG")
 
     uploaded_files = st.file_uploader(
         label="Choose PDF files",
         type=["pdf"],
-        accept_multiple_files=True,
-        help="Upload lecture notes, assignments, or any academic PDFs.",
+        accept_multiple_files=True
     )
 
-    # Process button — only shown after files are selected
     if uploaded_files:
         if st.button("⚡ Process & Index PDFs", type="primary", use_container_width=True):
             os.makedirs(DATA_DIR, exist_ok=True)
 
-            # Save uploaded files to the data/ directory
-            saved_paths = []
             for uploaded_file in uploaded_files:
-                save_path = os.path.join(DATA_DIR, uploaded_file.name)
-                with open(save_path, "wb") as f:
+                with open(os.path.join(DATA_DIR, uploaded_file.name), "wb") as f:
                     f.write(uploaded_file.getbuffer())
-                saved_paths.append(save_path)
 
-            # Run the ingestion pipeline (defined in ingest.py)
-            with st.spinner("🔍 Extracting text, chunking, and embedding PDFs..."):
-                num_chunks = ingest_pdfs(DATA_DIR, CHROMA_DIR, OPENAI_API_KEY, EMBEDDING_MODEL)
+            with st.spinner("🔍 Processing locally..."):
+                num_chunks = ingest_pdfs(DATA_DIR)
 
-            # Load the QA chain after ingestion
             st.session_state.qa_chain = load_qa_chain()
             st.session_state.docs_ingested = True
             st.session_state.ingested_files = [f.name for f in uploaded_files]
 
-            st.success(f"✅ Indexed {num_chunks} chunks from {len(uploaded_files)} PDF(s)!")
+            st.success(f"✅ Indexed {num_chunks} chunks!")
 
     st.divider()
 
-    # ── Knowledge Base Status ────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-header">🗄️ Knowledge Base</div>', unsafe_allow_html=True)
-
-    if st.session_state.docs_ingested:
-        st.markdown('<span class="badge-success">● Active</span>', unsafe_allow_html=True)
-        if st.session_state.ingested_files:
-            st.markdown("**Loaded files:**")
-            for fname in st.session_state.ingested_files:
-                st.markdown(f"- 📄 {fname}")
-    else:
-        st.markdown('<span class="badge-info">○ No documents loaded</span>', unsafe_allow_html=True)
-        st.info("Upload PDFs above to get started.")
-
-    st.divider()
-
-    # ── Clear Chat ────────────────────────────────────────────────────────────
-    if st.button("🗑️ Clear Chat History", use_container_width=True):
-        st.session_state.chat_history = []
-        # Rebuild chain to reset memory
-        if st.session_state.qa_chain:
-            st.session_state.qa_chain = load_qa_chain()
+    if st.button("🗑️ Clear Chat", use_container_width=True):
+        st.session_state.clear()
         st.rerun()
 
-    st.divider()
-
-    # ── Settings Info ─────────────────────────────────────────────────────────
-    with st.expander("⚙️ Settings"):
-        st.markdown(f"**LLM:** `{MODEL_NAME}`")
-        st.markdown(f"**Embeddings:** `{EMBEDDING_MODEL}`")
-        st.markdown(f"**Chunks retrieved:** `{TOP_K}`")
-        st.markdown(f"**Vector DB:** ChromaDB")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN CHAT AREA
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("# 🎓 Academic Assistant")
-st.markdown("Ask questions about your uploaded study materials. I answer *only* using the content in your documents.")
-st.divider()
-
-# ── Render existing chat history ──────────────────────────────────────────────
+st.markdown("# 🎓 Local Academic Assistant")
 for question, answer, sources in st.session_state.chat_history:
-    # User message
-    with st.chat_message("user", avatar="🧑‍🎓"):
-        st.markdown(question)
-
-    # Assistant message
-    with st.chat_message("assistant", avatar="📚"):
+    with st.chat_message("user"): st.markdown(question)
+    with st.chat_message("assistant"):
         st.markdown(answer)
-
-        # Show source references for this historical message.
-        # expanded=False keeps old messages tidy — the student can
-        # click open any one they want to re-read.
         render_sources(sources, expanded=False)
 
+# Prepare chat history for download
 
-# ── Chat input box ─────────────────────────────────────────────────────────────
-user_question = st.chat_input(
-    placeholder="Ask a question about your documents...",
-    disabled=not st.session_state.docs_ingested,
+chat_history_text = ""
+
+for question, answer, _ in st.session_state.chat_history:
+    chat_history_text += f"User: {question}\n"
+    chat_history_text += f"Assistant: {answer}\n"
+    chat_history_text += "-" * 60 + "\n"
+
+# Download Chat History
+
+st.download_button(
+    label="📥 Download Chat History",
+    data=chat_history_text,
+    file_name="chat_history.txt",
+    mime="text/plain",
+    use_container_width=True,
 )
 
-# ── If the user has typed a question ─────────────────────────────────────────
+user_question = st.chat_input(placeholder="Ask a question...", disabled=not st.session_state.docs_ingested)
 if user_question:
-    if not st.session_state.qa_chain:
-        st.error("⚠️ Please upload and process PDF documents first.")
-        st.stop()
-
-    # Show the user's message immediately
-    with st.chat_message("user", avatar="🧑‍🎓"):
-        st.markdown(user_question)
-
-    # Generate the answer using the RAG chain
-    with st.chat_message("assistant", avatar="📚"):
-        with st.spinner("🔍 Searching documents and generating answer..."):
-            # The chain: retrieves chunks → formats prompt → calls GPT → returns answer
-            result = st.session_state.qa_chain.invoke({"question": user_question})
-
-            answer           = result.get("answer", "I could not find an answer in the uploaded documents.")
-            source_documents = result.get("source_documents", [])
-
+    with st.chat_message("user"): st.markdown(user_question)
+    with st.chat_message("assistant"):
+        with st.spinner("🔍 Thinking..."):
+            lcel_history = []
+            for q, a, _ in st.session_state.chat_history:
+                lcel_history.extend([HumanMessage(content=q), AIMessage(content=a)])
+            result = st.session_state.qa_chain.invoke({"input": user_question, "chat_history": lcel_history})
+            answer = result.get("answer", "No response.")
+            sources = result.get("context", [])
         st.markdown(answer)
+        render_sources(sources, expanded=True)
+    st.session_state.chat_history.append((user_question, answer, sources))
 
-        # Show source references for the new answer.
-        # expanded=True pops it open immediately so the student sees
-        # exactly which chunks the AI used to form this response.
-        render_sources(source_documents, expanded=True)
+# ==========================================================
+# Footer
+# ==========================================================
 
-    # Persist this exchange to session history
-    st.session_state.chat_history.append((user_question, answer, source_documents))
-
-
-# ── Empty state prompt ────────────────────────────────────────────────────────
-if not st.session_state.chat_history and st.session_state.docs_ingested:
-    st.markdown("""
-    <div style='text-align:center; color:#888; padding:40px 0;'>
-        <h3 style='color:#aaa;'>💬 Ask your first question!</h3>
-        <p>Try: <em>"Summarise the key topics in this document."</em></p>
-        <p>Or: <em>"What does the document say about neural networks?"</em></p>
+st.markdown("---")
+st.markdown(
+    """
+    <div style="text-align:center; color:gray; font-size:14px;">
+        🎓 <b>AI-Powered Academic Assistant using Retrieval-Augmented Generation (RAG)</b><br>
+        Developed by <b>Harsh</b> & <b>Karim</b>
     </div>
-    """, unsafe_allow_html=True)
-
-if not st.session_state.docs_ingested:
-    st.markdown("""
-    <div style='text-align:center; color:#888; padding:60px 0;'>
-        <h2 style='color:#aaa;'>📂 Start by uploading your PDFs</h2>
-        <p>Use the sidebar on the left to upload lecture notes, assignments, or any academic PDF.</p>
-        <p>Once processed, you can ask questions and get answers grounded in your documents.</p>
-    </div>
-    """, unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
