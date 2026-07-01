@@ -5,7 +5,7 @@ Handles:
 1. PDF loading
 2. Text extraction
 3. Chunking
-4. Embeddings (local)
+4. Embeddings (local HuggingFace)
 5. Storage in ChromaDB
 """
 
@@ -14,68 +14,66 @@ from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 
-DB_DIR = "chroma_db"
+DB_DIR = "./chroma_db"
 
-
-# -----------------------------
-# STEP 1: Extract text from PDF
-# -----------------------------
 def extract_text(pdf_path):
     reader = PdfReader(pdf_path)
-    docs = []
-
+    pages_data = []
     for i, page in enumerate(reader.pages):
         text = page.extract_text() or ""
-
         if text.strip():
-            docs.append({
+            pages_data.append({
                 "text": text,
-                "page": i + 1})
-    return docs
+                "page": i
+            })
+    return pages_data
 
-# -----------------------------
-# STEP 2: Chunk text
-# -----------------------------
-def split_text(text, source_name="unknown"):
+def split_text(pages_data, source_name="unknown"):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
-        chunk_overlap=50)
+        chunk_overlap=50
+    )
+    all_chunks = []
+    for page_entry in pages_data:
+        chunks = splitter.split_text(page_entry["text"])
+        for chunk in chunks:
+            all_chunks.append(
+                Document(
+                    page_content=chunk,
+                    metadata={
+                        "source": source_name,
+                        "page": page_entry["page"]
+                    }
+                )
+            )
+    return all_chunks
 
-    docs = splitter.create_documents([text])
-
-    for d in docs:
-        d.metadata["source"] = source_name
-    return docs
-
-
-# -----------------------------
-# STEP 3: Load Vector DB
-# -----------------------------
 def get_vector_store():
     embeddings = HuggingFaceEmbeddings(
         model_name="all-MiniLM-L6-v2"
     )
-
     return Chroma(
         persist_directory=DB_DIR,
-        embedding_function=embeddings
+        embedding_function=embeddings,
+        collection_name="academic_docs"
     )
 
-
-# -----------------------------
-# STEP 4: Ingest PDF
-# -----------------------------
-def ingest_pdf(pdf_path, source_name="unknown"):
-    text = extract_text(pdf_path)
-    chunks = split_text(text)
-
+def ingest_pdfs(data_dir, chroma_dir=DB_DIR, openai_api_key=None, embedding_model=None):
     vector_store = get_vector_store()
+    total_chunks = 0
 
-    for chunk in chunks:
-        chunk.metadata["source"] = source_name
+    if not os.path.exists(data_dir):
+        return 0
 
-    vector_store.add_documents(chunks)
-    vector_store.persist()
+    for filename in os.listdir(data_dir):
+        if filename.lower().endswith(".pdf"):
+            pdf_path = os.path.join(data_dir, filename)
+            pages_data = extract_text(pdf_path)
+            chunks = split_text(pages_data, source_name=pdf_path)
+            if chunks:
+                vector_store.add_documents(chunks)
+                total_chunks += len(chunks)
 
-    return len(chunks)
+    return total_chunks
