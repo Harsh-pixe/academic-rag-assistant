@@ -16,10 +16,13 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 # Local module for ingesting PDFs
 from ingest import ingest_pdfs
+from io import BytesIO
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
 
 CHROMA_DIR   = "./chroma_db"
 DATA_DIR     = "./data"
-MODEL_NAME   = "phi3:mini"
+MODEL_NAME   = "llama3.2"
 TOP_K        = 4
 
 st.set_page_config(
@@ -46,7 +49,10 @@ def load_qa_chain():
         collection_name="academic_docs",
     )
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": TOP_K})
-    llm = ChatOllama(model=MODEL_NAME, temperature=0.2)
+    llm = ChatOllama(
+    model=MODEL_NAME,
+    temperature=0.2,
+    streaming=False)
 
     contextualize_q_system_prompt = (
         "Given a chat history and the latest user question which might reference context in the chat history, "
@@ -72,6 +78,31 @@ def load_qa_chain():
 
     question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
     return create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+def generate_pdf(question, answer):
+    """
+    Creates a PDF containing the user's question and the AI's answer.
+    Returns the PDF as bytes.
+    """
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(buffer)
+    styles = getSampleStyleSheet()
+
+    elements = [
+        Paragraph("<b>AI-Powered Academic Assistant</b>", styles["Title"]),
+        Paragraph("<br/>", styles["Normal"]),
+        Paragraph(f"<b>Question:</b><br/>{question}", styles["BodyText"]),
+        Paragraph("<br/>", styles["Normal"]),
+        Paragraph(f"<b>Answer:</b><br/>{answer}", styles["BodyText"]),
+    ]
+
+    doc.build(elements)
+
+    pdf = buffer.getvalue()
+    buffer.close()
+
+    return pdf
 
 def render_sources(source_documents: list, expanded: bool = False):
     if not source_documents:
@@ -120,7 +151,7 @@ with st.sidebar:
     st.divider()
 
     if st.button("🗑️ Clear Chat", use_container_width=True):
-        st.session_state.clear()
+        st.session_state.chat_history = []
         st.rerun()
 
 st.markdown("# 🎓 Local Academic Assistant")
@@ -162,6 +193,13 @@ if user_question:
             sources = result.get("context", [])
         st.markdown(answer)
         render_sources(sources, expanded=True)
+        pdf_file = generate_pdf(user_question, answer)
+
+        st.download_button(
+            label="📄 Download Answer as PDF",
+            data=pdf_file,
+            file_name="academic_answer.pdf",
+            mime="application/pdf",)
     st.session_state.chat_history.append((user_question, answer, sources))
 
 # ==========================================================
