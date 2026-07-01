@@ -209,56 +209,34 @@ def load_qa_chain():
 # ── Helper: render source citations for a list of retrieved chunks ─────────────
 def render_sources(source_documents: list, expanded: bool = False):
     """
-    Displays each retrieved chunk as:
-        📄  lecture_notes.pdf — Page 3
-        "...the actual text that was retrieved from that page..."
-
-    Why a helper function?
-        We call this in two places — when replaying chat history AND when
-        displaying a brand-new answer. A helper means we write the logic
-        once and reuse it, so both places always look identical.
-
-    Args:
-        source_documents : list of LangChain Document objects returned by
-                           the RAG chain under the key "source_documents".
-        expanded         : whether the expander starts open or collapsed.
-                           True for new answers (user wants to see sources
-                           immediately), False for replayed history (keeps
-                           the screen tidy).
+    Gives each retrieved chunk its own collapsible expander, showing:
+      - PDF filename and page number in the expander header
+      - The retrieved text passage inside the expander body
     """
     if not source_documents:
         return  # Nothing to show — exit early
 
-    with st.expander("📎 Sources used", expanded=expanded):
+    st.caption(f"📎 {len(source_documents)} source chunk(s) retrieved")
 
-        # We loop through every retrieved chunk (up to TOP_K = 4).
-        # Each chunk is a LangChain Document with two attributes:
-        #   doc.page_content  — the raw text of this chunk
-        #   doc.metadata      — a dict containing "source" and "page"
-        for i, doc in enumerate(source_documents):
+    for i, doc in enumerate(source_documents):
 
-            # ── Extract metadata ──────────────────────────────────────────
-            source_path = doc.metadata.get("source", "Unknown document")
-            raw_page    = doc.metadata.get("page", 0)
+        # ── 1. Pull out filename and page number ──────────────────────────
+        source_path = doc.metadata.get("source", "Unknown document")
+        raw_page    = doc.metadata.get("page", 0)
 
-            # FIX: PyPDF numbers pages from 0 internally, but humans
-            # expect page 1 to mean the first page.  Adding 1 here means
-            # "Page 1" in the UI always matches what the student sees
-            # when they open the PDF in their viewer.
-            human_page = raw_page + 1
+        # PyPDF numbers pages from 0 internally — add 1 to match PDF viewer
+        human_page = raw_page + 1
 
-            # Show just the filename, not the full path on disk.
-            # e.g.  "./data/lecture_notes.pdf"  →  "lecture_notes.pdf"
-            file_label = os.path.basename(source_path)
+        # Strip folder path: "./data/notes.pdf"  →  "notes.pdf"
+        file_label = os.path.basename(source_path)
 
-            # ── Chunk text ────────────────────────────────────────────────
-            # doc.page_content is the exact text that was fed to the LLM.
-            # We truncate to 400 characters so it's readable but not
-            # overwhelming — a "…" at the end signals there's more.
-            chunk_text = doc.page_content.strip()
-            if len(chunk_text) > 400:
-                chunk_text = chunk_text[:400] + "…"
+        # ── 2. Build the expander label ───────────────────────────────────
+        expander_label = f"📄 {file_label} — Page {human_page}"
 
+        # ── 3. One expander per chunk ─────────────────────────────────────
+        with st.expander(expander_label, expanded=expanded):
+            st.caption(f"Chunk {i + 1} of {len(source_documents)}")
+            st.markdown(doc.page_content.strip())
             # ── Render: header badge then quoted text ─────────────────────
             st.markdown(
                 f'<div class="source-box">'
